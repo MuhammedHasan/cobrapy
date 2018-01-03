@@ -8,14 +8,13 @@ where possible to provide a uniform interface.
 
 from __future__ import absolute_import, division
 
-import ctypes
 from collections import namedtuple
 from logging import getLogger
-from multiprocessing import Array, Pool
 from time import time
 
 import numpy as np
 import pandas
+from joblib import Parallel, delayed
 from optlang.interface import OPTIMAL
 from optlang.symbolics import Zero
 from cobra.util import (create_stoichiometric_matrix, constraint_matrices,
@@ -62,84 +61,6 @@ nullspace : numpy.matrix
     A matrix containing the nullspace of the equality constraints. Each column
     is one basis vector.
 """
-
-
-def mp_init(obj):
-    """Initialize the multiprocessing pool."""
-    global sampler
-    sampler = obj
-
-
-def shared_np_array(shape, data=None, integer=False):
-    """Create a new numpy array that resides in shared memory.
-
-    Parameters
-    ----------
-    shape : tuple of ints
-        The shape of the new array.
-    data : numpy.array
-        Data to copy to the new array. Has to have the same shape.
-    integer : boolean
-        Whether to use an integer array. Defaults to False which means
-        float array.
-    """
-    size = np.prod(shape)
-    if integer:
-        array = Array(ctypes.c_int64, int(size))
-        np_array = np.frombuffer(array.get_obj(), dtype="int64")
-    else:
-        array = Array(ctypes.c_double, int(size))
-        np_array = np.frombuffer(array.get_obj())
-    np_array = np_array.reshape(shape)
-
-    if data is not None:
-        if len(shape) != len(data.shape):
-            raise ValueError("`data` must have the same dimensions"
-                             "as the created array.")
-        same = all(x == y for x, y in zip(shape, data.shape))
-        if not same:
-            raise ValueError("`data` must have the same shape"
-                             "as the created array.")
-        np_array[:] = data
-
-    return np_array
-
-
-# Has to be declared outside of class to be used for multiprocessing :(
-def _step(sampler, x, delta, fraction=None):
-    """Sample a new feasible point from the point `x` in direction `delta`."""
-    prob = sampler.problem
-    valid = ((np.abs(delta) > feasibility_tol) &
-             np.logical_not(prob.variable_fixed))
-    # permissible alphas for staying in variable bounds
-    valphas = ((1.0 - bounds_tol) * prob.variable_bounds - x)[:, valid]
-    valphas = (valphas / delta[valid]).flatten()
-    if prob.bounds.shape[0] > 0:
-        # permissible alphas for staying in constraint bounds
-        balphas = ((1.0 - bounds_tol) * prob.bounds -
-                   prob.inequalities.dot(x))
-        balphas = (balphas / prob.inequalities.dot(delta)).flatten()
-        # combined alphas
-        alphas = np.hstack([valphas, balphas])
-    else:
-        alphas = valphas
-    alpha_range = (alphas[alphas > 0.0].min(), alphas[alphas <= 0.0].max())
-
-    if fraction:
-        alpha = alpha_range[0] + fraction * (alpha_range[1] - alpha_range[0])
-    else:
-        alpha = np.random.uniform(alpha_range[0], alpha_range[1])
-    p = x + alpha * delta
-
-    # Numerical instabilities may cause bounds invalidation
-    # reset sampler and sample from one of the original warmup directions
-    # if that occurs
-    if np.any(sampler._bounds_dist(p) < -bounds_tol):
-        LOGGER.info("found bounds infeasibility in sample, "
-                    "resetting to center")
-        newdir = sampler.warmup[np.random.randint(sampler.n_warmup)]
-        return _step(sampler, sampler.center, newdir - sampler.center)
-    return p
 
 
 class HRSampler(object):
@@ -230,16 +151,15 @@ class HRSampler(object):
         # Set up a projection that can cast point into the nullspace
         nulls = nullspace(equalities)
         # convert bounds to a matrix and add variable bounds as well
+
         return Problem(
-            equalities=shared_np_array(equalities.shape, equalities),
-            b=shared_np_array(b.shape, b),
-            inequalities=shared_np_array(prob.inequalities.shape,
-                                         prob.inequalities),
-            bounds=shared_np_array(bounds.shape, bounds),
-            variable_fixed=shared_np_array(prob.variable_fixed.shape,
-                                           prob.variable_fixed, integer=True),
-            variable_bounds=shared_np_array(var_bounds.shape, var_bounds),
-            nullspace=shared_np_array(nulls.shape, nulls),
+            equalities=equalities,
+            b=b,
+            inequalities=prob.inequalities,
+            bounds=bounds,
+            variable_fixed=prob.variable_fixed,
+            variable_bounds=var_bounds,
+            nullspace=nulls,
             homogeneous=homogeneous
         )
 
@@ -276,8 +196,7 @@ class HRSampler(object):
             # revert objective
             self.model.objective.set_linear_coefficients({variables[i]: 0})
         # Shrink warmup points to measure
-        self.warmup = shared_np_array((self.n_warmup, len(variables)),
-                                      self.warmup[0:self.n_warmup, ])
+        self.warmup = self.warmup[0:self.n_warmup, ]
 
     def _reproject(self, p):
         """Reproject a point into the feasibility region.
@@ -327,6 +246,42 @@ class HRSampler(object):
             lb_dist = min(lb_dist, const_lb_dist)
             ub_dist = min(ub_dist, const_ub_dist)
         return np.array([lb_dist, ub_dist])
+
+    def _step(self, x, delta, fraction=None):
+        """Sample a new feasible point from the point `x` in direction `delta`."""
+        prob = self.problem
+        valid = ((np.abs(delta) > feasibility_tol) &
+                 np.logical_not(prob.variable_fixed))
+        # permissible alphas for staying in variable bounds
+        valphas = ((1.0 - bounds_tol) * prob.variable_bounds - x)[:, valid]
+        valphas = (valphas / delta[valid]).flatten()
+        if prob.bounds.shape[0] > 0:
+            # permissible alphas for staying in constraint bounds
+            balphas = ((1.0 - bounds_tol) * prob.bounds -
+                       prob.inequalities.dot(x))
+            balphas = (balphas / prob.inequalities.dot(delta)).flatten()
+            # combined alphas
+            alphas = np.hstack([valphas, balphas])
+        else:
+            alphas = valphas
+        alpha_range = (alphas[alphas > 0.0].min(), alphas[alphas <= 0.0].max())
+
+        if fraction:
+            alpha = alpha_range[0] + fraction * \
+                (alpha_range[1] - alpha_range[0])
+        else:
+            alpha = np.random.uniform(alpha_range[0], alpha_range[1])
+        p = x + alpha * delta
+
+        # Numerical instabilities may cause bounds invalidation
+        # reset sampler and sample from one of the original warmup directions
+        # if that occurs
+        if np.any(self._bounds_dist(p) < -bounds_tol):
+            LOGGER.info("found bounds infeasibility in sample, "
+                        "resetting to center")
+            newdir = self.warmup[np.random.randint(self.n_warmup)]
+            return self._step(self.center, newdir - self.center)
+        return p
 
     def sample(self, n, fluxes=True):
         """Abstract sampling function.
@@ -514,12 +469,12 @@ class ACHRSampler(HRSampler):
         pi = np.random.randint(self.n_warmup)
         # mix in the original warmup points to not get stuck
         delta = self.warmup[pi, ] - self.center
-        self.prev = _step(self, self.prev, delta)
+        self.prev = self._step(self.prev, delta)
         if self.problem.homogeneous and (self.n_samples *
                                          self.thinning % nproj == 0):
             self.prev = self._reproject(self.prev)
         self.center = (self.n_samples * self.center + self.prev) / (
-                       self.n_samples + 1)
+            self.n_samples + 1)
         self.n_samples += 1
 
     def sample(self, n, fluxes=True):
@@ -551,7 +506,7 @@ class ACHRSampler(HRSampler):
         for i in range(1, self.thinning * n + 1):
             self.__single_iteration()
             if i % self.thinning == 0:
-                samples[i//self.thinning - 1, ] = self.prev
+                samples[i // self.thinning - 1, ] = self.prev
 
         if fluxes:
             names = [r.id for r in self.model.reactions]
@@ -561,38 +516,6 @@ class ACHRSampler(HRSampler):
         else:
             names = [v.name for v in self.model.variables]
             return pandas.DataFrame(samples, columns=names)
-
-
-# Unfortunately this has to be outside the class to be usable with
-# multiprocessing :()
-def _sample_chain(args):
-    """Sample a single chain for OptGPSampler.
-
-    center and n_samples are updated locally and forgotten afterwards.
-    """
-    n, idx = args       # has to be this way to work in Python 2.7
-    center = sampler.center
-    np.random.seed((sampler._seed + idx) % np.iinfo(np.int32).max)
-    pi = np.random.randint(sampler.n_warmup)
-    prev = sampler.warmup[pi, ]
-    prev = _step(sampler, center, prev - center, 0.95)
-    n_samples = max(sampler.n_samples, 1)
-    samples = np.zeros((n, center.shape[0]))
-
-    for i in range(1, sampler.thinning * n + 1):
-        pi = np.random.randint(sampler.n_warmup)
-        delta = sampler.warmup[pi, ] - center
-
-        prev = _step(sampler, prev, delta)
-        if sampler.problem.homogeneous and (n_samples *
-                                            sampler.thinning % nproj == 0):
-            prev = sampler._reproject(prev)
-        if i % sampler.thinning == 0:
-            samples[i//sampler.thinning - 1, ] = prev
-            center = (n_samples * center + prev) / (n_samples + 1)
-            n_samples += 1
-
-    return samples
 
 
 class OptGPSampler(HRSampler):
@@ -680,8 +603,35 @@ class OptGPSampler(HRSampler):
 
         # This maps our saved center into shared memory,
         # meaning they are synchronized across processes
-        self.center = shared_np_array((len(model.variables), ),
-                                      self.warmup.mean(axis=0))
+        self.center = self.warmup.mean(axis=0)
+
+    def _sample_chain(self, args):
+        """Sample a single chain for OptGPSampler.
+
+        center and n_samples are updated locally and forgotten afterwards.
+        """
+        n, idx = args       # has to be this way to work in Python 2.7
+        center = self.center
+        np.random.seed((self._seed + idx) % np.iinfo(np.int32).max)
+        pi = np.random.randint(self.n_warmup)
+        prev = self.warmup[pi, ]
+        prev = self._step(center, prev - center, 0.95)
+        n_samples = max(self.n_samples, 1)
+        samples = np.zeros((n, center.shape[0]))
+
+        for i in range(1, self.thinning * n + 1):
+            pi = np.random.randint(self.n_warmup)
+            delta = self.warmup[pi, ] - center
+
+            prev = self._step(prev, delta)
+            if self.problem.homogeneous and (n_samples *
+                                             self.thinning % nproj == 0):
+                prev = self._reproject(prev)
+            if i % self.thinning == 0:
+                samples[i // self.thinning - 1, ] = prev
+                center = (n_samples * center + prev) / (n_samples + 1)
+                n_samples += 1
+        return samples
 
     def sample(self, n, fluxes=True):
         """Generate a set of samples.
@@ -715,28 +665,15 @@ class OptGPSampler(HRSampler):
         we recommend to calculate large numbers of samples at once
         (`n` > 1000).
         """
-        if self.np > 1:
-            n_process = np.ceil(n / self.np).astype(int)
-            n = n_process * self.np
-            # The cast to list is weird but not doing it gives recursion
-            # limit errors, something weird going on with multiprocessing
-            args = list(zip([n_process] * self.np, range(self.np)))
-            # No with statement or starmap here since Python 2.x
-            # does not support it :(
-            mp = Pool(self.np, initializer=mp_init, initargs=(self,))
-            chains = mp.map(_sample_chain, args, chunksize=1)
-            mp.close()
-            mp.join()
-            chains = np.vstack(chains)
-        else:
-            mp_init(self)
-            chains = _sample_chain((n, 0))
+        n_process = np.ceil(n / self.np).astype(int)
+        n = n_process * self.np
 
-        # Update the global center
-        self.center = (self.n_samples * self.center +
-                       n * np.atleast_2d(chains).mean(axis=0)) / (
-                       self.n_samples + n)
-        self.n_samples += n
+        chains = Parallel(n_jobs=self.np)(
+            delayed(self._sample_chain)(
+                (n_process, i)) for i in range(self.np))
+        chains = np.vstack(chains)
+
+        self._update_center(chains, n)
 
         if fluxes:
             names = [r.id for r in self.model.reactions]
@@ -746,6 +683,12 @@ class OptGPSampler(HRSampler):
         else:
             names = [v.name for v in self.model.variables]
             return pandas.DataFrame(chains, columns=names)
+
+    def _update_center(self, chains, n):
+        self.center, n_samples = np.average(
+            np.vstack([np.atleast_2d(chains).mean(axis=0), self.center]),
+            axis=0, weights=[n, self.n_samples], returned=True)
+        self.n_samples = n_samples[0]
 
     # Models can be large so don't pass them around during multiprocessing
     def __getstate__(self):

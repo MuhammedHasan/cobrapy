@@ -47,7 +47,8 @@ setup(
         "numpy>=1.6",
         "pandas>=0.17.0",
         "optlang>=1.2.5",
-        "tabulate"
+        "tabulate",
+        "joblib>=0.11"
     ],
     tests_require=[
         "jsonschema > 2.5",
@@ -56,10 +57,10 @@ setup(
     ],
     extras_require=extras,
     package_data={
-         '': [
-             'test/data/*',
-             'mlab/matlab_scripts/*m'
-         ]
+        '': [
+            'test/data/*',
+            'mlab/matlab_scripts/*m'
+        ]
     },
     author="The cobrapy core team",
     author_email="cobra-pie@googlegroups.com",
