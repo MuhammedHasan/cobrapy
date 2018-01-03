@@ -14,7 +14,7 @@ from time import time
 
 import numpy as np
 import pandas
-from joblib import Parallel, delayed
+from joblib import Parallel, delayed, cpu_count
 from optlang.interface import OPTIMAL
 from optlang.symbolics import Zero
 from cobra.util import (create_stoichiometric_matrix, constraint_matrices,
@@ -61,6 +61,12 @@ nullspace : numpy.matrix
     A matrix containing the nullspace of the equality constraints. Each column
     is one basis vector.
 """
+
+
+def chunks(l, n):
+    """Yield successive n-sized chunks from l."""
+    for i in range(0, len(l), n):
+        yield l[i:i + n]
 
 
 class HRSampler(object):
@@ -163,7 +169,7 @@ class HRSampler(object):
             homogeneous=homogeneous
         )
 
-    def generate_fva_warmup(self):
+    def generate_fva_warmup(self, n_jobs=1):
         """Generate the warmup points for the sampler.
 
         Generates warmup points by setting each flux as the sole objective
@@ -171,32 +177,50 @@ class HRSampler(object):
         warmup points into the nullspace for non-homogeneous problems (only
         if necessary).
         """
-        self.n_warmup = 0
-        idx = np.hstack([self.fwd_idx, self.rev_idx])
-        self.warmup = np.zeros((len(idx), len(self.model.variables)))
         self.model.objective = Zero
         self.model.objective.direction = "max"
-        variables = self.model.variables
-        for i in idx:
-            # Omit fixed reactions
+
+        idx = np.hstack([self.fwd_idx, self.rev_idx])
+        filtered_idx = list(self._filter_fixes_variables(idx))
+
+        warmup = Parallel(n_jobs=n_jobs)(
+            delayed(self._maximize_variable)
+            (self.model.solver, i)
+            for i in chunks(filtered_idx, 500))
+
+        self.warmup = np.vstack([w for w in warmup if w is not None])
+        self.n_warmup = self.warmup.shape[0]
+
+    def _filter_fixes_variables(self, variable_indexes):
+        for i in variable_indexes:
+
             if self.problem.variable_fixed[i]:
                 LOGGER.info("skipping fixed variable %s" %
-                            variables[i].name)
+                            self.model.variables[i].name)
                 continue
-            self.model.objective.set_linear_coefficients({variables[i]: 1})
-            self.model.slim_optimize()
-            if not self.model.solver.status == OPTIMAL:
+            yield i
+
+    @staticmethod
+    def _maximize_variable(solver, indexes):
+        warmups = np.zeros((len(indexes), len(solver.variables)))
+
+        for i, index in enumerate(indexes):
+            variable = solver.variables[index]
+
+            solver.objective.set_linear_coefficients({variable: 1})
+            solver.optimize()
+
+            if not solver.status == OPTIMAL:
                 LOGGER.info("can not maximize variable %s, skipping it" %
-                            variables[i].name)
-                continue
-            primals = self.model.solver.primal_values
-            sol = [primals[v.name] for v in self.model.variables]
-            self.warmup[self.n_warmup, ] = sol
-            self.n_warmup += 1
-            # revert objective
-            self.model.objective.set_linear_coefficients({variables[i]: 0})
-        # Shrink warmup points to measure
-        self.warmup = self.warmup[0:self.n_warmup, ]
+                            variable.name)
+                return
+
+            prims = solver.primal_values
+            solver.objective.set_linear_coefficients({variable: 0})
+
+            warmups[i, ] = np.fromiter((prims[v.name]
+                                        for v in solver.variables), np.float)
+        return warmups
 
     def _reproject(self, p):
         """Reproject a point into the feasibility region.
@@ -598,8 +622,9 @@ class OptGPSampler(HRSampler):
     def __init__(self, model, processes, thinning=100, seed=None):
         """Initialize a new OptGPSampler."""
         super(OptGPSampler, self).__init__(model, thinning, seed=seed)
-        self.generate_fva_warmup()
-        self.np = processes
+
+        self.generate_fva_warmup(n_jobs=processes)
+        self.np = cpu_count() if processes == -1 else processes
 
         # This maps our saved center into shared memory,
         # meaning they are synchronized across processes
